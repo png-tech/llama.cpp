@@ -624,7 +624,58 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
             ggml-cpu/arch/e2k/quants.c
             ggml-cpu/arch/e2k/cpu-feats.cpp
             )
-        list(APPEND ARCH_FLAGS -ffast-math -fno-finite-math-only -mno-f16c -Wno-pointer-qual)
+        # -mno-f16c removed (E6): LCC F16C emulation verified correct and ~19x
+        # faster than the scalar fallback (e5/f16c_probe.c); with the flag,
+        # vec.h f16 ops and tinyBLAS F16C paths degrade to scalar conversions
+        list(APPEND ARCH_FLAGS -ffast-math -fno-finite-math-only -Wno-pointer-qual)
+        # ISA-adaptive tuning: probe the toolchain's native __iset__ and target
+        # that ISA explicitly (elbrus-v5 on E8C2, elbrus-v6 on newer machines).
+        # E9 tested -mtune=elbrus-8c2 and -frestrict-params on hot TUs: neutral
+        # (within noise), reverted to keep the diff minimal
+        include(CheckCSourceCompiles)
+        check_c_source_compiles("#if !defined(__e2k__) || __iset__ < 6\n#error\n#endif\nint main(){return 0;}" GGML_E2K_ISA_V6)
+        check_c_source_compiles("#if !defined(__e2k__) || __iset__ < 5\n#error\n#endif\nint main(){return 0;}" GGML_E2K_ISA_V5)
+        if (GGML_E2K_ISA_V6)
+            list(APPEND ARCH_FLAGS -march=elbrus-v6)
+        elseif (GGML_E2K_ISA_V5)
+            list(APPEND ARCH_FLAGS -march=elbrus-v5)
+        endif()
+        # LCC on e2k defines __SSSE3__/__AVX2__ and emulates x86 intrinsics, so
+        # arch/x86/quants.c compiles as-is and provides SIMD vec_dot for all quant
+        # types. The native e2k q4_0 kernel is kept (faster than emulated AVX2),
+        # quantize_row_q8_* stay generic. (The earlier mxfp4 exclusion was a
+        # test artifact: random E8M0 scales overflowed one accumulation order
+        # to inf; with clamped scales the sweep is clean, see E1b.)
+        set_source_files_properties(ggml-cpu/arch/x86/quants.c PROPERTIES
+            COMPILE_DEFINITIONS "ggml_vec_dot_q4_0_q8_0=ggml_vec_dot_q4_0_q8_0_x86;quantize_row_q8_0=quantize_row_q8_0_x86;quantize_row_q8_1=quantize_row_q8_1_x86;quantize_row_q8_K=quantize_row_q8_K_x86")
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/arch/x86/quants.c
+            )
+        # Tiled gemm/gemv kernels for the repack path: the x86 8x8 kernels
+        # compile as-is (LCC emulates their AVX2 intrinsics) and are the only
+        # definition of their bare names; arch-fallback.h drops the generic
+        # redirects for them. Their one bare fallback reference (iq4_nl 4x4)
+        # is redirected to the generic kernel. Layouts without an x86 kernel
+        # (4x4/4x8/8x4, q5_K/q6_K 8x8, q1_0) stay generic.
+        # -mf16c overrides the block-level -mno-f16c: the F16C-less helpers in
+        # simd-mappings.h take non-const ggml_fp16_t* and fail to compile with
+        # the const call sites in the gemv/gemm templates (upstream only ever
+        # builds this file with F16C). LCC cvtph emulation is verified correct
+        # and fast by .spec/test-build/e5/f16c_probe.c
+        set_source_files_properties(ggml-cpu/arch/x86/repack.cpp PROPERTIES
+            COMPILE_DEFINITIONS "ggml_gemm_iq4_nl_4x4_q8_0=ggml_gemm_iq4_nl_4x4_q8_0_generic"
+            COMPILE_OPTIONS "-mf16c")
+        list(APPEND GGML_CPU_SOURCES
+            ggml-cpu/arch/x86/repack.cpp
+            )
+        # Q1_0 repack functions: redirect bare names to _generic variants
+        # so that all TUs can resolve the symbols regardless of include order
+        list(APPEND ARCH_DEFINITIONS
+            "ggml_gemv_q1_0_4x4_q8_0=ggml_gemv_q1_0_4x4_q8_0_generic"
+            "ggml_gemv_q1_0_4x8_q8_0=ggml_gemv_q1_0_4x8_q8_0_generic"
+            "ggml_gemm_q1_0_4x4_q8_0=ggml_gemm_q1_0_4x4_q8_0_generic"
+            "ggml_gemm_q1_0_4x8_q8_0=ggml_gemm_q1_0_4x8_q8_0_generic"
+        )
         ggml_add_cpu_backend_features(${GGML_CPU_NAME} e2k ${ARCH_DEFINITIONS})
     else()
         message(WARNING "Unknown CPU architecture. Falling back to generic implementations.")
